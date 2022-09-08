@@ -1,0 +1,68 @@
+image: registry.gitlab.com/pearsondivvycloud/groupsrolessync:latest
+
+stages:
+  - build
+  - deploy
+  - test
+
+variables:
+  DEFAULT_REGION: us-east-1
+  GIT_SSL_NO_VERIFY: "1"
+  GIT_DEPTH: 10
+  DOCKER_DRIVER: overlay2
+  DOCKER_HOST: tcp://docker:2375/
+  GET_SOURCES_ATTEMPTS: 3
+  LOGLEVEL: "DEBUG"
+  BUCKET: slater-cloudability-us-east-1-361247020131
+  ROLE_ARN: arn:aws:iam::361247020131:role/PCMFinOps
+
+.before_script_template: &assume_role_script
+  before_script:
+    - source ./ci/deploy/assume-role.sh
+
+build:
+  stage: build
+  allow_failure: false
+  except:
+    refs:
+      - master
+  tags:
+    - default
+  variables:
+    CONFIG_BUCKET: slater-cloudability-us-east-1-361247020131
+    ROLE_ARN: arn:aws:iam::361247020131:role/PCMFinOps
+  <<: *assume_role_script
+  script:
+    - echo Validating Lambda
+    - ci/build/validate-lambda.sh
+    - echo sam build
+    - ci/build/build.sh
+
+deploy:
+  stage: deploy
+  allow_failure: false
+  when: manual
+  except:
+    refs:
+      - master
+  tags:
+    - default
+  variables:
+    CONFIG_BUCKET: slater-cloudability-us-east-1-361247020131
+    ROLE_ARN: arn:aws:iam::361247020131:role/PCMFinOps
+  <<: *assume_role_script
+  script:
+      - ci/deploy/package.sh
+      - ci/deploy/deploy.sh
+
+test:
+  stage: test
+  allow_failure: false
+  variables:
+    DIVVY_DEV_TEST_TARGET: https://pearsonedu-dev.customer.divvycloud.com
+    CONFIG_BUCKET: slater-cloudability-us-east-1-361247020131
+    ROLE_ARN: arn:aws:iam::361247020131:role/PCMFinOps
+  <<: *assume_role_script
+  script:
+    - echo You must purge DIVVY_DEV_TEST_TARGET of at least 1 group/role/mapping to have adequate code coverage.
+    - tests/synchronize-ldap-divvy.sh --divvy_base_url ${DIVVY_DEV_TEST_TARGET} # --purge_divvy_exclusion

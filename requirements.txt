@@ -1,0 +1,24 @@
+# Only include AWS SAM CLI, pytest support, db access support
+# and profiling support only.  Keep this to bare minimum for
+# sam build, newman api testing and pytesting.
+
+# DO NOT include botocore or boto3 here as sam local does that for you
+aws-sam-cli==1.23.0 # 1.10.0
+boto3-type-annotations==0.3.1
+pytest >= 5.4.2
+pytest_pythonpath >= 0.7.3
+pytest-profiling >= 1.7.0
+pytest_env >= 0.6.2
+pytest-order >= 0.11.0
+aws_xray_sdk == 2.8.0
+coverage >= 5.3
+ldap3>=2.9
+setuptools~=56.0.0
+regex==2021.4.4
+requests==2.23.0
+PyYAML==5.4.1
+wrapt==1.12.1
+pycodestyle==2.7.0
+pylint==2.8.2
+cfn-lint==0.52.0
+aws-lambda-logging==0.1.1

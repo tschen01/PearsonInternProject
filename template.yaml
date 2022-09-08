@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+   SAM Template for updating cloudability with slater data.
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout:  300 # 5 minutes (in seconds)
+    MemorySize: 3008 # we need 2GB+ to ensure we get full vCPU, rather than a partial vCPU
+    Tracing: Active
+    Runtime: python3.8
+    Environment:
+      Variables:
+        AWS_XRAY_TRACING_NAME: "Cloudability"
+        AWS_XRAY_SDK_ENABLED: "true"
+        AWS_XRAY_CONTEXT_MISSING: "LOG_ERROR"
+        SECRET_REGION: 'us-east-1'
+        LOG_LEVEL: 'info'
+        BUCKET_NAME: "slater-cloudability-us-east-1-361247020131"
+        BUCKET_ARTIFACT: "prsn-code-artifacts-us-east-1-361247020131"
+        SENDGRID_SECRET_NAME: "unknown"
+        SENDGRIDKEY: "unknown"
+Parameters:
+  S3BucketName:
+    Description: Existing s3 bucket serving artifact downloads
+    Type: String
+    Default: slater-cloudability-us-east-1-361247020131
+  S3LoggingBucket:
+    Description: Bucket where cloudfront logging will be directed
+    Type: String
+    Default: prsn-s3-access-logs-us-east-1-361247020131 # .s3.amazonaws.com
+  S3LoggingBucketPrefix:
+    Description: Bucket prefix to direct logging specifically
+    Type: String
+    Default: slater-to-cloudability
+
+
+Mappings:
+  Accounts:
+    # FinOps account
+    '361247020131':
+      EnvironmentTagValue: DEV
+      DeploymentPreference: AllAtOnce
+      LogRetentionDays: 30
+      LogLevel: debug
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3LoggingBucket
+        LogFilePrefix: !Sub '${S3LoggingBucketPrefix}'
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  CloudabilityFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      FunctionName: CloudabilityFunction
+      CodeUri: ./lambdas/cloudability/
+      Handler: function.handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          LOG_LEVEL: !FindInMap [ Accounts, !Ref AWS::AccountId, LogLevel ]
+      Events:
+        CloudabilityEvent:
+          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Properties:
+            Path: /synchronize
+            Method: get
+        ScheduleTrigger:
+          Type: Schedule
+          Properties:
+            Description: Schedule Slater to Cloudability Update
+            Input: >
+              {
+                "action": ""
+              }
+            Enabled: False
+            Schedule: 'rate(1 day)'
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref S3BucketName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: "arn:aws:secretsmanager:us-east-1:361247020131:secret:slater-authorization-api-X4MlAh"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: "arn:aws:secretsmanager:us-east-1:361247020131:secret:cloudability-authorization-api-srVZoN"
+
+  CloudabilityStepFunctionsRole:
+    DependsOn:
+    - CloudabilityFunction
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: String
+      Policies:
+        - PolicyName: CloudabilityStepFunctionsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+                - lambda:InvokeFunction
+                Resource: '*'
+      RoleName: CloudabilityStepFunctionsRole
+      Tags:
+        - Key: "t_dcl"
+          Value: "2"
+        - Key: "Name"
+          Value: "CloudabilityStepFunctionsRole"
+
+  CloudabilityStepFunctions:
+    DependsOn: CloudabilityFunction
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: ./auxiliary/stepfunctions/slatertocloudabilitydata.asl.json
+#      DefinitionSubstitutions:
+#        accountsToTappIdsFunction: !GetAtt SlaterAccountsToTAppIds.Arn
+#        dataLoaderFunction: !GetAtt SlaterPostgresDataLoader.Arn
+      Role: !GetAtt CloudabilityStepFunctionsRole.Arn
+
+  SlaterSchedulerRole:
+    DependsOn:
+    - CloudabilityFunction
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: String
+      Policies:
+        - PolicyName: CloudabilityStepFunctionsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - states:StartExecution
+                Resource:
+                - !GetAtt CloudabilityStepFunctions.Arn
+      RoleName: CloudabilitySchedulerRole
+      Tags:
+        - Key: "t_dcl"
+          Value: "2"
+        - Key: "Name"
+          Value: "CloudabilitySchedulerRole"
+
+
+  CloudabilityRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudabilityRule
+      RoleArn: !GetAtt
+        - CloudabilitySchedulerRole
+        - Arn
+      ScheduleExpression: 'cron(0 22 ? * MON-FRI *)'
+      State: !FindInMap
+        - Accounts
+        - !Ref AWS::AccountId
+        - ruleState
+      Targets:
+        - Arn: !GetAtt
+            - CloudabilityStepFunctions
+            - Arn
+          Id: CloudabilityRule
+          RoleArn: !GetAtt
+            - SlaterSchedulerRole
+            - Arn
+
+# SlaterAccountsToTAppIdsTopic:
+#    Type: AWS::SNS::Topic
+#    Properties:
+#      DisplayName: SlaterAccountsToTAppIdsTopic
+#      Subscription:
+#        - Endpoint: !FindInMap
+#            - Accounts
+#            - !Ref AWS::AccountId
+#            - snsEndpoint
+#          Protocol: !FindInMap
+#            - Accounts
+#            - !Ref AWS::AccountId
+#            - snsProtocol
+#      Tags:
+#        - Key: "t_dcl"
+#          Value: "2"
+#        - Key: "Name"
+#          Value: "SlaterAccountsToTAppIdsTopic"
+
+#  SlaterAccountsToTAppIdsAlarm:
+#    DependsOn:
+#    - SlaterAccountsToTAppIdsStepFunction
+#    Type: AWS::CloudWatch::Alarm
+#    Properties:
+#      AlarmDescription: SlaterAccountsToTAppIdsStepFunction failures
+#      AlarmName: SlaterAccountsToTAppIdsAlarm
+#      ComparisonOperator: GreaterThanOrEqualToThreshold
+#      EvaluationPeriods: 1
+#      Threshold: 1
+#      MetricName: ExecutionsFailed
+#      Namespace: AWS/States
+#      Period: !!int 86400
+#      Statistic: Maximum
+#      TreatMissingData: breaching
+#      AlarmActions:
+#      - Ref: "SlaterAccountsToTAppIdsTopic"
+#      Dimensions:
+#      - Name: StateMachineArn
+#        Value: !GetAtt SlaterAccountsToTAppIdsStepFunction.Arn
+
+Outputs:
+
+  S3Bucket:
+    Description: "S3 Bucket"
+    Value: !Ref S3Bucket
+
+  CloudabilityFunction:
+    Description: "CloudabilityFunction Lambda Function ARN"
+    Value: !GetAtt CloudabilityFunction.Arn
